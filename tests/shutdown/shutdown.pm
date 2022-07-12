@@ -13,6 +13,7 @@ use power_action_utils 'power_action';
 use utils;
 
 sub run {
+    send_key "ctrl-alt-f7";
     power_action('poweroff');
 }
 

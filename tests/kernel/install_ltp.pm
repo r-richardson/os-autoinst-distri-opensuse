@@ -31,6 +31,23 @@ use Utils::Backends 'get_serial_console';
 use kdump_utils;
 use transactional;
 
+sub wait_for_repo {
+    my ($repo_url, $timeout) = @_;
+    $timeout ||= 1800;    # 30m
+    my $start_time = time;
+
+    while (time - $start_time < $timeout) {
+        my $ret = script_run("curl -s --head $repo_url | grep '200 OK'");
+        if ($ret == 0) {
+            record_info('Repo Available', "Repository $repo_url is now accessible.");
+            return 1;
+        }
+        record_info('Waiting', "Repository $repo_url not yet available. Retrying in 60 seconds...");
+        sleep 60;
+    }
+    die "Repository $repo_url is not available after waiting for $timeout seconds. Possible reasons: the repository has not been synced yet, or it contains embargoed data.";
+}
+
 sub add_we_repo_if_available {
     # opensuse doesn't have extensions
     return if (is_opensuse || is_jeos);
@@ -355,6 +372,7 @@ sub run {
         install_debugging_tools;
     }
     else {
+        wait_for_repo(get_required_var('QA_HEAD_REPO'));
         add_ltp_repo;
         install_from_repo();
         if (get_var("LTP_GIT_URL")) {

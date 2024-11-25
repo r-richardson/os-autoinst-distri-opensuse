@@ -30,6 +30,106 @@ use virt_autotest::utils 'is_xen_host';
 use Utils::Backends 'get_serial_console';
 use kdump_utils;
 use transactional;
+use Try::Tiny;
+use Time::HiRes qw(time);
+
+sub wait_for_repo_sync {
+    my ($repo_name, $timeout) = @_;
+    $timeout ||= 300;    # Default timeout of 5 minutes
+
+    zypper_call('in perl-Net-AMQP-RabbitMQ');
+
+    # Load the module dynamically
+    eval {
+        require Net::AMQP::RabbitMQ;
+        Net::AMQP::RabbitMQ->import();
+        1;
+    } or do {
+        my $error = $@ || 'Unknown error';
+        die "Failed to load Net::AMQP::RabbitMQ: $error";
+    };
+
+    my $host = 'rabbit.suse.de';
+    my $user = 'suse';
+    my $password = 'suse';
+    my $port = 5671;    # AMQPS port
+
+    my $exchange = 'pubsub';
+    my $routing_key = 'suse.repopusher.repo.sync_finished';
+
+    my $mq = Net::AMQP::RabbitMQ->new();
+
+    # Connect to RabbitMQ server
+    try {
+        $mq->connect($host, {
+                port => $port,
+                user => $user,
+                password => $password,
+                ssl => 1,
+                ssl_verify_host => 0,    # TODO: Doesnt seem to work
+        });
+    } catch {
+        die "Failed to connect to RabbitMQ server: $_";
+    };
+
+    $mq->channel_open(1);
+
+    try {
+        $mq->exchange_declare(1, $exchange, {
+                exchange_type => 'topic',
+                passive => 1,
+                durable => 1,
+        });
+    } catch {
+        die "Failed to declare exchange: $_";
+    };
+
+    my $queue_name;
+    try {
+        $queue_name = $mq->queue_declare(1, '', {
+                exclusive => 1,
+                auto_delete => 1,
+        });
+    } catch {
+        die "Failed to declare queue: $_";
+    };
+
+    # Bind the queue to the exchange with the specific routing key
+    try {
+        $mq->queue_bind(1, $queue_name, $exchange, $routing_key);
+    } catch {
+        die "Failed to bind queue: $_";
+    };
+
+    $mq->consume(1, $queue_name, {no_ack => 1});
+
+    record_info('Waiting for repo sync', "Waiting for repo '$repo_name' to be synced. Timeout: $timeout seconds.");
+
+    my $start_time = time;
+    while (time - $start_time < $timeout) {
+        my $msg;
+        try {
+            $msg = $mq->recv(10);    # 10-second timeout on recv
+        } catch {
+            warn "Failed to receive message: $_";
+            next;
+        };
+        if (defined $msg) {
+            my $body = $msg->{body};
+            my $rk = $msg->{routing_key};
+            record_info('Received message', "Routing key: $rk, Body: $body");
+            if ($body =~ /\Q$repo_name\E/) {
+                record_info('Repo Synced', "Repository '$repo_name' has been synced.");
+                return 1;
+            }
+        } else {
+            # No message received within recv timeout
+            sleep 1;
+        }
+    }
+    die "Timeout waiting for repository '$repo_name' to be synced after $timeout seconds. Possible reasons: the repository has not been synced yet, or it contains embargoed data.";
+}
+
 
 sub add_we_repo_if_available {
     # opensuse doesn't have extensions
@@ -355,6 +455,16 @@ sub run {
         install_debugging_tools;
     }
     else {
+        my $qa_head_repo_url = get_required_var('QA_HEAD_REPO');
+        my $repo_name;
+        if ($qa_head_repo_url =~ m|https?://[^/]+/ibs/(.*)|) {
+            $repo_name = $1;
+        } else {
+            die "Failed to extract repository name from QA_HEAD_REPO: $qa_head_repo_url";
+        }
+        # TODO check if repo is already up-to-date / available,
+        # if not:
+        wait_for_repo_sync($repo_name);
         add_ltp_repo;
         install_from_repo();
         if (get_var("LTP_GIT_URL")) {
